@@ -89,6 +89,7 @@ export const en = {
   providerProtocol: 'Protocol',
   providerProtocolAnthropic: 'Anthropic /messages',
   providerProtocolOpenAI: 'OpenAI /chat/completions',
+  providerProtocolResponses: 'OpenAI /responses (honors reasoning effort)',
   providerNoAttachments:
     'This provider is OpenAI-compatible and cannot accept attachments. Remove them and send again.',
   providerModelsPlaceholder: 'Model ids, comma separated',

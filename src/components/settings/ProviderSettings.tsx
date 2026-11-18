@@ -111,6 +111,7 @@ const ProviderCard = ({ id }: { id: string }) => {
         options={[
           { value: 'anthropic', label: t('providerProtocolAnthropic') },
           { value: 'openai', label: t('providerProtocolOpenAI') },
+          { value: 'responses', label: t('providerProtocolResponses') },
         ]}
         onChange={(protocol) => updateProvider(id, { protocol })}
         ariaLabel={t('providerProtocol')}

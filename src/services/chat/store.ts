@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
-import { ApiError, streamChatCompletion, streamMessage } from '../api/client.js'
+import { ApiError, streamChatCompletion, streamMessage, streamResponses } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
@@ -893,7 +893,7 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   // 否则快照里仍是旧 id，补传会直接复用它。
   request = refreshRequest(sessionId, request)
   // OpenAI 兼容端点没有 Files API：附件不上传，请求里也不会带文件块
-  if (resolveRequestTarget().protocol === 'openai') {
+  if (['openai', 'responses'].includes(resolveRequestTarget().protocol)) {
     const session = getSession(sessionId)
     const resolve = <T extends Message>(message: T): T =>
       (session?.messages.find((item) => item.id === message.id) as T | undefined) ?? message
@@ -1098,16 +1098,25 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
         }
         // 自定义提供商可选 Anthropic /messages 或 OpenAI /chat/completions；内置 DeepSeek 始终走 Anthropic
+        // 自定义提供商可选 Anthropic /messages、OpenAI /chat/completions 或 /responses；内置 DeepSeek 始终走 Anthropic
         const events =
-          target.protocol === 'openai'
-            ? streamChatCompletion(
+          target.protocol === 'responses'
+            ? streamResponses(
                 target.apiKey,
                 payload,
                 controller.signal,
                 target.baseUrl ?? '',
                 reasoningEffort()
               )
-            : streamMessage(target.apiKey, payload, controller.signal, target.baseUrl)
+            : target.protocol === 'openai'
+              ? streamChatCompletion(
+                  target.apiKey,
+                  payload,
+                  controller.signal,
+                  target.baseUrl ?? '',
+                  reasoningEffort()
+                )
+              : streamMessage(target.apiKey, payload, controller.signal, target.baseUrl)
         const blockIndexes = new Map<number, number>()
         for await (const event of events) {
           receivedContent ||= event.type === 'content_block_start'

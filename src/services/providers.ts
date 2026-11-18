@@ -2,8 +2,12 @@ import { create } from 'zustand'
 import { ApiError, listModels } from './api/client.js'
 import { translate } from '../i18n/index.js'
 
-/** 兼容协议：Anthropic 的 /messages 或 OpenAI 的 /chat/completions */
-export type ProviderProtocol = 'anthropic' | 'openai'
+/** 兼容协议：Anthropic /messages、OpenAI /chat/completions，或 OpenAI Responses /responses */
+export type ProviderProtocol = 'anthropic' | 'openai' | 'responses'
+
+/** 读取持久化数据时收敛非法协议值 */
+const toProtocol = (value: unknown): ProviderProtocol =>
+  value === 'openai' || value === 'responses' ? value : 'anthropic'
 
 /** 用户自行添加的模型提供商 */
 export type CustomProvider = {
@@ -41,7 +45,7 @@ const read = (): CustomProvider[] => {
         id: typeof item.id === 'string' && item.id ? item.id : createId(),
         name: typeof item.name === 'string' ? item.name : '',
         baseUrl: typeof item.baseUrl === 'string' ? item.baseUrl : '',
-        protocol: item.protocol === 'openai' ? 'openai' : 'anthropic',
+        protocol: toProtocol(item.protocol),
         apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
         models: Array.isArray(item.models)
           ? item.models.filter((model): model is string => typeof model === 'string')
@@ -70,9 +74,9 @@ export const PRESET_PROVIDER_ID = 'p_505zc_codex'
 const PRESET_PROVIDER: CustomProvider = {
   id: PRESET_PROVIDER_ID,
   name: '505zc Codex',
-  // 该端点的 CORS 只放行 Authorization，浏览器里只能走 OpenAI /chat/completions
   baseUrl: 'https://codex.505zc.tech/v1',
-  protocol: 'openai',
+  // 该端点的原生协议是 Responses：只有这条路径会执行思考档位（reasoning.effort）
+  protocol: 'responses',
   apiKey: '',
   models: [],
   enabled: true,

@@ -86,6 +86,7 @@ export const zh = {
   providerProtocol: '协议',
   providerProtocolAnthropic: 'Anthropic /messages',
   providerProtocolOpenAI: 'OpenAI /chat/completions',
+  providerProtocolResponses: 'OpenAI /responses（执行思考档位）',
   providerNoAttachments: '当前提供商是 OpenAI 兼容端点，无法上传附件，请移除附件后再发送。',
   providerModelsPlaceholder: '模型 ID，用逗号分隔',
   providerCatalogIdPlaceholder: 'models.dev 提供商 id（可选，用于取模型信息）',

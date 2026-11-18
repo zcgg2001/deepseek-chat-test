@@ -473,3 +473,185 @@ export async function* streamChatCompletion(
   yield { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage }
   yield { type: 'message_stop' }
 }
+
+// ---------- OpenAI Responses（POST /responses） ----------
+
+/**
+ * Responses 的 input：与 chat 一样只回传正文。
+ * 历史思考是上一轮的加密推理项，无法跨请求复用，因此这里不带。
+ */
+const toResponsesInput = (
+  body: CreateMessageRequest
+): { role: 'user' | 'assistant'; content: string }[] => {
+  const input: { role: 'user' | 'assistant'; content: string }[] = []
+  for (const message of body.messages) {
+    if (message.role === 'latest_reminder') {
+      continue
+    }
+    const content =
+      typeof message.content === 'string' ? message.content : joinTextBlocks(message.content)
+    if (content) {
+      input.push({ role: message.role, content })
+    }
+  }
+  return input
+}
+
+/** Responses 的用量字段名与 chat 不同，这里统一成本应用的 MessageUsage */
+const toResponsesUsage = (raw: Record<string, unknown>): MessageUsage => ({
+  input_tokens: typeof raw.input_tokens === 'number' ? raw.input_tokens : 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+  output_tokens: typeof raw.output_tokens === 'number' ? raw.output_tokens : 0,
+})
+
+/**
+ * POST /responses（stream: true），把 Responses API 的事件归一化成本应用的事件序列：
+ * 思考摘要（reasoning_summary_text.delta）在前、正文（output_text.delta）在后。
+ * 思考档位映射成 reasoning.effort —— 这是中转站唯一真正执行的参数入口。
+ * 只用于协议设为 responses 的提供商；附件、服务端工具与标题生成在该协议下不可用。
+ */
+export async function* streamResponses(
+  apiKey: string,
+  body: CreateMessageRequest,
+  signal: AbortSignal,
+  baseUrl: string,
+  reasoningEffort?: string | null
+): AsyncGenerator<MessageStreamEvent> {
+  // 附件靠 Files API 的 file_id 引用，Responses 端点这边无从取用：明确报错，不静默丢附件
+  if (hasFile(body)) {
+    throw new ApiError('protocol', { key: 'providerNoAttachments' })
+  }
+  const url = `${baseUrl.replace(/\/+$/, '')}/responses`
+  const effort = body.thinking.type === 'enabled' ? (reasoningEffort ?? null) : null
+  const payload = {
+    model: body.model,
+    // Responses 用 instructions 承载系统提示词，input 里只放对话
+    instructions: body.system,
+    input: toResponsesInput(body),
+    stream: true,
+    ...(effort ? { reasoning: { effort, summary: 'auto' } } : {}),
+  }
+  let response: Response
+  try {
+    response = await request(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    })
+  } catch (error) {
+    // 中转站的 5xx 会带具体原因（如上游账号选择超时）：去掉状态码，直接展示服务端原文
+    if (error instanceof ApiError && error.kind === 'http' && (error.status ?? 0) >= 500 && error.message) {
+      throw new ApiError('http', error.message)
+    }
+    throw error
+  }
+  const contentType = response.headers.get('Content-Type') ?? ''
+  if (!response.body || !contentType.includes('text/event-stream')) {
+    throw new ApiError('protocol', (await response.text().catch(() => '')) || response.statusText)
+  }
+
+  let nextIndex = 0
+  let open: 'thinking' | 'text' | null = null
+  let thinkingIndex = -1
+  let textIndex = -1
+  let stopReason: StopReason = 'end_turn'
+  let usage: MessageUsage | undefined
+
+  yield {
+    type: 'message_start',
+    message: { id: `resp_${Date.now().toString(36)}`, model: body.model },
+  }
+
+  for await (const { data } of readServerSentEvents(response.body, signal)) {
+    if (data === '[DONE]') {
+      break
+    }
+    let payload: unknown
+    try {
+      payload = JSON.parse(data)
+    } catch {
+      continue
+    }
+    if (!isRecord(payload)) {
+      continue
+    }
+    const type = typeof payload.type === 'string' ? payload.type : ''
+    if (type === 'response.reasoning_summary_text.delta') {
+      const delta = typeof payload.delta === 'string' ? payload.delta : ''
+      if (!delta) {
+        continue
+      }
+      if (open !== 'thinking') {
+        if (open === 'text') {
+          yield { type: 'content_block_stop', index: textIndex }
+        }
+        thinkingIndex = nextIndex++
+        open = 'thinking'
+        yield {
+          type: 'content_block_start',
+          index: thinkingIndex,
+          content_block: { type: 'thinking', thinking: '', signature: '' },
+        }
+      }
+      yield {
+        type: 'content_block_delta',
+        index: thinkingIndex,
+        delta: { type: 'thinking_delta', thinking: delta },
+      }
+      continue
+    }
+    if (type === 'response.output_text.delta') {
+      const delta = typeof payload.delta === 'string' ? payload.delta : ''
+      if (!delta) {
+        continue
+      }
+      if (open !== 'text') {
+        if (open === 'thinking') {
+          yield { type: 'content_block_stop', index: thinkingIndex }
+        }
+        textIndex = nextIndex++
+        open = 'text'
+        yield {
+          type: 'content_block_start',
+          index: textIndex,
+          content_block: { type: 'text', text: '' },
+        }
+      }
+      yield {
+        type: 'content_block_delta',
+        index: textIndex,
+        delta: { type: 'text_delta', text: delta },
+      }
+      continue
+    }
+    if (type === 'response.completed' || type === 'response.incomplete') {
+      const result = isRecord(payload.response) ? payload.response : {}
+      if (isRecord(result.usage)) {
+        usage = toResponsesUsage(result.usage)
+      }
+      if (type === 'response.incomplete') {
+        stopReason = 'max_tokens'
+      }
+      break
+    }
+    if (type === 'response.failed' || type === 'error') {
+      const result = isRecord(payload.response) ? payload.response : {}
+      const error = isRecord(payload.error) ? payload.error : isRecord(result.error) ? result.error : {}
+      throw new ApiError('stream', typeof error.message === 'string' ? error.message : '')
+    }
+  }
+
+  if (open === 'thinking') {
+    yield { type: 'content_block_stop', index: thinkingIndex }
+  } else if (open === 'text') {
+    yield { type: 'content_block_stop', index: textIndex }
+  }
+  yield { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage }
+  yield { type: 'message_stop' }
+}
