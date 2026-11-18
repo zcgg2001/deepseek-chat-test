@@ -6,7 +6,7 @@ A static chat demo powered by the DeepSeek API. No application backend is requir
 
 This repository is an unofficial derivative of [deepseek-ai/chat-demo](https://github.com/deepseek-ai/chat-demo), rebuilt and extended for UI research. It is not affiliated with or endorsed by DeepSeek. The UI is implemented piece by piece against chat.deepseek.com.
 
-You can [try the app online](https://hmjz100.github.io/deepseek-chat-demo/) or download the archive from [Releases](https://github.com/hmjz100/deepseek-chat-demo/releases), extract it, and double-click `index.html` to use it locally without installation or a build. Enter your API key in Settings before your first chat.
+You can [try the app online](https://deepseek.505zc.me/) or download the archive from [Releases](https://github.com/hmjz100/deepseek-chat-demo/releases), extract it, and double-click `index.html` to use it locally without installation or a build. Enter your API key in Settings before your first chat.
 
 ## Getting started
 
