@@ -4,7 +4,7 @@ import { ApiError, streamChatCompletion, streamMessage } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
-import { THINKING_EFFORT_BUDGET, useSettings } from '../settings.js'
+import { THINKING_EFFORT_BUDGET, THINKING_EFFORT_REASONING, useSettings } from '../settings.js'
 import { useProviders, type ProviderProtocol } from '../providers.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
@@ -46,6 +46,10 @@ const thinkingBudget = (): { budget_tokens?: number } => {
   const budget = THINKING_EFFORT_BUDGET[useSettings.getState().thinkingEffort]
   return budget === null ? {} : { budget_tokens: budget }
 }
+
+/** OpenAI 协议用 reasoning_effort 表达思考强度；标准档不传，交给端点默认值 */
+const reasoningEffort = (): string | null =>
+  THINKING_EFFORT_REASONING[useSettings.getState().thinkingEffort]
 
 /**
  * 把当前的提供商选择解析成请求目标：内置 DeepSeek 走官方地址与 API Key，
@@ -1055,14 +1059,16 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         reply = { ...reply, latestReminder }
         updateReply(sessionId, reply)
         persist(sessionId)
+        const target = resolveRequestTarget()
         const messages = toRequestMessages(
           prepared.history,
           prepared.question,
           prepared.prefix,
           initial.thinking ?? false,
-          latestReminder
+          latestReminder,
+          // OpenAI 兼容端点靠 reasoning_content 回传历史思考，Anthropic 协议的历史思考服务端会丢弃
+          target.protocol === 'openai'
         )
-        const target = resolveRequestTarget()
         const payload: CreateMessageRequest = {
           model: initial.model ?? MODEL,
           system: SYSTEM_PROMPT,
@@ -1079,7 +1085,13 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         // 自定义提供商可选 Anthropic /messages 或 OpenAI /chat/completions；内置 DeepSeek 始终走 Anthropic
         const events =
           target.protocol === 'openai'
-            ? streamChatCompletion(target.apiKey, payload, controller.signal, target.baseUrl ?? '')
+            ? streamChatCompletion(
+                target.apiKey,
+                payload,
+                controller.signal,
+                target.baseUrl ?? '',
+                reasoningEffort()
+              )
             : streamMessage(target.apiKey, payload, controller.signal, target.baseUrl)
         const blockIndexes = new Map<number, number>()
         for await (const event of events) {

@@ -219,8 +219,16 @@ export const listModels = async (
   return [...new Set(ids)]
 }
 
-/** OpenAI 兼容端点的消息体：只有纯文本，扩展字段一律不带 */
-type ChatMessageParam = { role: 'system' | 'user' | 'assistant'; content: string }
+/**
+ * OpenAI 兼容端点的消息体：正文之外只在 assistant 上带 reasoning_content，
+ * 用来把上一轮的思考回传给模型；其余扩展字段一律不带。
+ */
+type ChatMessageParam = {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+  /** 仅 assistant：上一轮的思考文本；端点不认识时会被降级重发去掉 */
+  reasoning_content?: string
+}
 
 /** 只取文本块拼接；图片与文档块依赖 Files API，OpenAI 兼容端点无法引用，直接跳过 */
 const joinTextBlocks = (blocks: { type: string; text?: string }[]): string =>
@@ -230,11 +238,20 @@ const joinTextBlocks = (blocks: { type: string; text?: string }[]): string =>
     .filter(Boolean)
     .join('\n\n')
 
+/** 只取思考块拼接，按到达顺序合并，供 reasoning_content 回传 */
+const joinThinkingBlocks = (blocks: { type: string; thinking?: string }[]): string =>
+  blocks
+    .filter((block) => block.type === 'thinking' && typeof block.thinking === 'string')
+    .map((block) => block.thinking as string)
+    .filter(Boolean)
+    .join('\n\n')
+
 /**
  * 把本应用的请求体转换成 OpenAI 兼容格式：
  * 服务端工具（deepseek_*）、思考预算、标题生成与内容安全校验都是扩展字段，兼容端点不认识，统一丢弃。
+ * `withReasoning` 为 false 时连历史思考一起丢掉，用于端点拒绝推理参数后的降级重发。
  */
-const toChatMessages = (body: CreateMessageRequest): ChatMessageParam[] => {
+const toChatMessages = (body: CreateMessageRequest, withReasoning = true): ChatMessageParam[] => {
   const messages: ChatMessageParam[] = [{ role: 'system', content: body.system }]
   for (const message of body.messages) {
     // latest_reminder 是 Chat Engine 扩展角色，兼容端点不认识
@@ -248,10 +265,15 @@ const toChatMessages = (body: CreateMessageRequest): ChatMessageParam[] => {
       })
       continue
     }
-    // 历史助手消息只回传正文：思考块与工具块不属于 OpenAI 协议
+    // 历史助手消息回传正文与思考：思考转成 reasoning_content，模型才能衔接自己上一轮的推理
     const content = joinTextBlocks(message.content)
+    const reasoning = withReasoning ? joinThinkingBlocks(message.content) : ''
     if (content) {
-      messages.push({ role: 'assistant', content })
+      messages.push(
+        reasoning
+          ? { role: 'assistant', content, reasoning_content: reasoning }
+          : { role: 'assistant', content }
+      )
     }
   }
   return messages
@@ -303,36 +325,64 @@ const readChatPlainContent = (text: string): string | null => {
  * POST /chat/completions（stream: true），把 OpenAI 兼容分片归一化成本应用的事件序列：
  * 思考块（reasoning_content）在前、正文块在后，最后以 message_delta + message_stop 收尾。
  * 只用于协议设为 openai 的提供商；附件、服务端工具与标题生成在该协议下不可用。
+ * `reasoningEffort` 由界面档位映射而来，深度思考关闭时不参与请求。
  */
 export async function* streamChatCompletion(
   apiKey: string,
   body: CreateMessageRequest,
   signal: AbortSignal,
-  baseUrl: string
+  baseUrl: string,
+  reasoningEffort?: string | null
 ): AsyncGenerator<MessageStreamEvent> {
   // 附件靠 Files API 的 file_id 引用，OpenAI 兼容端点无从取用：明确报错，不静默丢附件
   if (hasFile(body)) {
     throw new ApiError('protocol', { key: 'providerNoAttachments' })
   }
+  const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+  }
+  const effort = body.thinking.type === 'enabled' ? (reasoningEffort ?? null) : null
+  /** withReasoning 为 false 时既不带推理等级，也不回传历史思考 */
+  const payload = (withReasoning: boolean) => {
+    // 深度思考关闭时不回传历史思考，避免把上一轮的推理混进这一轮
+    const reasoning = withReasoning && body.thinking.type === 'enabled'
+    return JSON.stringify({
+      model: body.model,
+      messages: toChatMessages(body, reasoning),
+      stream: true,
+      ...(reasoning && effort ? { reasoning_effort: effort } : {}),
+    })
+  }
+  const send = async (withReasoning: boolean) => {
+    try {
+      return await request(url, {
+        method: 'POST',
+        headers,
+        body: payload(withReasoning),
+        signal,
+      })
+    } catch (error) {
+      // 中转站的 5xx 会带具体原因（如上游账号选择超时）：去掉状态码，让会话直接展示服务端原文，
+      // 而不是笼统的「服务器繁忙」；没有原文时保持原错误
+      if (error instanceof ApiError && error.kind === 'http' && (error.status ?? 0) >= 500 && error.message) {
+        throw new ApiError('http', error.message)
+      }
+      throw error
+    }
+  }
   let response: Response
   try {
-    response = await request(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify({ model: body.model, messages: toChatMessages(body), stream: true }),
-      signal,
-    })
+    response = await send(true)
   } catch (error) {
-    // 中转站的 5xx 会带具体原因（如上游账号选择超时）：去掉状态码，让会话直接展示服务端原文，
-    // 而不是笼统的「服务器繁忙」；没有原文时保持原错误
-    if (error instanceof ApiError && error.kind === 'http' && (error.status ?? 0) >= 500 && error.message) {
-      throw new ApiError('http', error.message)
+    // 400 通常是端点不认 reasoning_effort 或消息里的 reasoning_content：去掉这两项重发一次，
+    // 避免严格校验的端点因扩展字段整体不可用
+    if (!(error instanceof ApiError && error.kind === 'http' && error.status === 400)) {
+      throw error
     }
-    throw error
+    response = await send(false)
   }
   const contentType = response.headers.get('Content-Type') ?? ''
   if (!response.body || !contentType.includes('text/event-stream')) {

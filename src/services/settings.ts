@@ -21,6 +21,13 @@ export const THINKING_EFFORT_BUDGET: Record<ThinkingEffort, number | null> = {
   max: 16384,
 }
 
+/** OpenAI 兼容端点的推理等级：standard 不传，交给端点默认值；极限用最高的 xhigh */
+export const THINKING_EFFORT_REASONING: Record<ThinkingEffort, string | null> = {
+  standard: null,
+  deep: 'high',
+  max: 'xhigh',
+}
+
 /** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态 */
 type Settings = {
   apiKey: string | null
