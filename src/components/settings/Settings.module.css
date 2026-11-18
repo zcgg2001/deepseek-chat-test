@@ -559,6 +559,14 @@
   }
 }
 
+/* 预置提供商的名称不可编辑：去掉输入框边框，文字纵向居中，与可编辑名称同高 */
+.providerStatic {
+  display: flex;
+  align-items: center;
+  border-color: transparent;
+  padding-left: 0;
+}
+
 .providerAdd {
   align-self: flex-start;
   height: 34px;

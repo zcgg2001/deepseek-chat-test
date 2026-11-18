@@ -2,6 +2,7 @@ import clsx from 'clsx'
 import { useEffect, useRef } from 'react'
 import { useTranslate } from '../i18n/index.js'
 import { useSettings } from '../services/settings.js'
+import { initPresetProviderModels } from '../services/providers.js'
 import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport.js'
 import {
   bindChatPersistence,
@@ -110,6 +111,8 @@ export const App = () => {
 
   useEffect(() => {
     void initChat()
+    // 预置提供商已填 Key 时，每次进入页面都重新获取一次服务端的最新模型列表
+    initPresetProviderModels()
     // 首次打开先在设置里输入 API Key
     ensureApiKey()
   }, [])

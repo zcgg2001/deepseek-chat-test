@@ -7,6 +7,8 @@ import type {
   FileObject,
   FilePurpose,
   MessageStreamEvent,
+  MessageUsage,
+  StopReason,
 } from './types.js'
 
 /** 构建期 API 地址，默认 https://api.deepseek.com；本地开发支持开发服务器代理 */
@@ -41,6 +43,9 @@ export class ApiError extends Error {
     this.localMessage = typeof message === 'string' ? undefined : message
   }
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null
 
 const isErrorBody = (value: unknown): value is ApiErrorBody =>
   typeof value === 'object' &&
@@ -188,4 +193,233 @@ export async function* streamMessage(
   }
   // 服务端没有提供错误内容时保持为空，不推测断流原因。
   throw new ApiError('interrupted', '')
+}
+
+// ---------- OpenAI 兼容（POST /chat/completions） ----------
+
+/** GET {baseUrl}/models（OpenAI 兼容），返回去重后的模型 id 列表 */
+export const listModels = async (
+  apiKey: string,
+  baseUrl: string,
+  signal?: AbortSignal
+): Promise<string[]> => {
+  const response = await request(`${baseUrl.replace(/\/+$/, '')}/models`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal,
+  })
+  const body: unknown = await response.json().catch(() => null)
+  const list = isRecord(body) && Array.isArray(body.data) ? body.data : []
+  const ids = list
+    .map((item) => (isRecord(item) && typeof item.id === 'string' ? item.id.trim() : ''))
+    .filter(Boolean)
+  if (ids.length === 0) {
+    throw new ApiError('protocol', { key: 'providerModelsEmpty' })
+  }
+  return [...new Set(ids)]
+}
+
+/** OpenAI 兼容端点的消息体：只有纯文本，扩展字段一律不带 */
+type ChatMessageParam = { role: 'system' | 'user' | 'assistant'; content: string }
+
+/** 只取文本块拼接；图片与文档块依赖 Files API，OpenAI 兼容端点无法引用，直接跳过 */
+const joinTextBlocks = (blocks: { type: string; text?: string }[]): string =>
+  blocks
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .filter(Boolean)
+    .join('\n\n')
+
+/**
+ * 把本应用的请求体转换成 OpenAI 兼容格式：
+ * 服务端工具（deepseek_*）、思考预算、标题生成与内容安全校验都是扩展字段，兼容端点不认识，统一丢弃。
+ */
+const toChatMessages = (body: CreateMessageRequest): ChatMessageParam[] => {
+  const messages: ChatMessageParam[] = [{ role: 'system', content: body.system }]
+  for (const message of body.messages) {
+    // latest_reminder 是 Chat Engine 扩展角色，兼容端点不认识
+    if (message.role === 'latest_reminder') {
+      continue
+    }
+    if (message.role === 'user') {
+      messages.push({
+        role: 'user',
+        content: typeof message.content === 'string' ? message.content : joinTextBlocks(message.content),
+      })
+      continue
+    }
+    // 历史助手消息只回传正文：思考块与工具块不属于 OpenAI 协议
+    const content = joinTextBlocks(message.content)
+    if (content) {
+      messages.push({ role: 'assistant', content })
+    }
+  }
+  return messages
+}
+
+/** 流式分片：正文在 choices[0].delta.content，思考在 delta.reasoning_content，用量在 usage */
+const readChatChunk = (value: unknown) => {
+  if (!isRecord(value)) {
+    return null
+  }
+  const choice = Array.isArray(value.choices) ? value.choices[0] : undefined
+  const delta = isRecord(choice) && isRecord(choice.delta) ? choice.delta : undefined
+  return {
+    reasoning: typeof delta?.reasoning_content === 'string' ? delta.reasoning_content : '',
+    text: typeof delta?.content === 'string' ? delta.content : '',
+    finish: isRecord(choice) && typeof choice.finish_reason === 'string' ? choice.finish_reason : '',
+    usage: isRecord(value.usage) ? value.usage : undefined,
+  }
+}
+
+const CHAT_STOP_REASONS: Record<string, StopReason> = {
+  stop: 'end_turn',
+  length: 'max_tokens',
+  tool_calls: 'tool_use',
+  function_call: 'tool_use',
+  content_filter: 'refusal',
+}
+
+const toMessageUsage = (raw: Record<string, unknown>): MessageUsage => ({
+  input_tokens: typeof raw.prompt_tokens === 'number' ? raw.prompt_tokens : 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+  output_tokens: typeof raw.completion_tokens === 'number' ? raw.completion_tokens : 0,
+})
+
+/** 200 + JSON（非 SSE）时，部分中转站把拒绝话术放在 choices[0].message.content，优先展示这段文字 */
+const readChatPlainContent = (text: string): string | null => {
+  try {
+    const body: unknown = JSON.parse(text)
+    const choice = isRecord(body) && Array.isArray(body.choices) ? body.choices[0] : undefined
+    const content = isRecord(choice) && isRecord(choice.message) ? choice.message.content : undefined
+    return typeof content === 'string' && content.trim() ? content : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * POST /chat/completions（stream: true），把 OpenAI 兼容分片归一化成本应用的事件序列：
+ * 思考块（reasoning_content）在前、正文块在后，最后以 message_delta + message_stop 收尾。
+ * 只用于协议设为 openai 的提供商；附件、服务端工具与标题生成在该协议下不可用。
+ */
+export async function* streamChatCompletion(
+  apiKey: string,
+  body: CreateMessageRequest,
+  signal: AbortSignal,
+  baseUrl: string
+): AsyncGenerator<MessageStreamEvent> {
+  // 附件靠 Files API 的 file_id 引用，OpenAI 兼容端点无从取用：明确报错，不静默丢附件
+  if (hasFile(body)) {
+    throw new ApiError('protocol', { key: 'providerNoAttachments' })
+  }
+  let response: Response
+  try {
+    response = await request(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({ model: body.model, messages: toChatMessages(body), stream: true }),
+      signal,
+    })
+  } catch (error) {
+    // 中转站的 5xx 会带具体原因（如上游账号选择超时）：去掉状态码，让会话直接展示服务端原文，
+    // 而不是笼统的「服务器繁忙」；没有原文时保持原错误
+    if (error instanceof ApiError && error.kind === 'http' && (error.status ?? 0) >= 500 && error.message) {
+      throw new ApiError('http', error.message)
+    }
+    throw error
+  }
+  const contentType = response.headers.get('Content-Type') ?? ''
+  if (!response.body || !contentType.includes('text/event-stream')) {
+    const text = await response.text().catch(() => '')
+    throw new ApiError('protocol', readChatPlainContent(text) ?? text)
+  }
+
+  let nextIndex = 0
+  let open: 'thinking' | 'text' | null = null
+  let thinkingIndex = -1
+  let textIndex = -1
+  let stopReason: StopReason = 'end_turn'
+  let usage: MessageUsage | undefined
+
+  yield {
+    type: 'message_start',
+    message: { id: `chatcmpl_${Date.now().toString(36)}`, model: body.model },
+  }
+
+  for await (const { data } of readServerSentEvents(response.body, signal)) {
+    if (data === '[DONE]') {
+      break
+    }
+    let payload: unknown
+    try {
+      payload = JSON.parse(data)
+    } catch {
+      continue
+    }
+    if (isErrorBody(payload)) {
+      throw new ApiError('stream', payload.error.message)
+    }
+    const chunk = readChatChunk(payload)
+    if (!chunk) {
+      continue
+    }
+    if (chunk.usage) {
+      usage = toMessageUsage(chunk.usage)
+    }
+    if (chunk.reasoning) {
+      if (open !== 'thinking') {
+        if (open === 'text') {
+          yield { type: 'content_block_stop', index: textIndex }
+        }
+        thinkingIndex = nextIndex++
+        open = 'thinking'
+        yield {
+          type: 'content_block_start',
+          index: thinkingIndex,
+          content_block: { type: 'thinking', thinking: '', signature: '' },
+        }
+      }
+      yield {
+        type: 'content_block_delta',
+        index: thinkingIndex,
+        delta: { type: 'thinking_delta', thinking: chunk.reasoning },
+      }
+    }
+    if (chunk.text) {
+      if (open !== 'text') {
+        if (open === 'thinking') {
+          yield { type: 'content_block_stop', index: thinkingIndex }
+        }
+        textIndex = nextIndex++
+        open = 'text'
+        yield {
+          type: 'content_block_start',
+          index: textIndex,
+          content_block: { type: 'text', text: '' },
+        }
+      }
+      yield {
+        type: 'content_block_delta',
+        index: textIndex,
+        delta: { type: 'text_delta', text: chunk.text },
+      }
+    }
+    if (chunk.finish) {
+      stopReason = CHAT_STOP_REASONS[chunk.finish] ?? 'end_turn'
+    }
+  }
+
+  if (open === 'thinking') {
+    yield { type: 'content_block_stop', index: thinkingIndex }
+  } else if (open === 'text') {
+    yield { type: 'content_block_stop', index: textIndex }
+  }
+  yield { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage }
+  yield { type: 'message_stop' }
 }

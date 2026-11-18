@@ -1,11 +1,11 @@
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
-import { ApiError, streamMessage } from '../api/client.js'
+import { ApiError, streamChatCompletion, streamMessage } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
 import { THINKING_EFFORT_BUDGET, useSettings } from '../settings.js'
-import { useProviders } from '../providers.js'
+import { useProviders, type ProviderProtocol } from '../providers.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import {
@@ -49,15 +49,19 @@ const thinkingBudget = (): { budget_tokens?: number } => {
 
 /**
  * 把当前的提供商选择解析成请求目标：内置 DeepSeek 走官方地址与 API Key，
- * 自定义提供商走它自己的地址和 Key（没填地址时回落到内置）。
+ * 自定义提供商走它自己的地址、Key 与协议（没填地址时回落到内置）。
  */
-const resolveRequestTarget = (): { apiKey: string; baseUrl?: string } => {
+const resolveRequestTarget = (): {
+  apiKey: string
+  baseUrl?: string
+  protocol: ProviderProtocol
+} => {
   const { providerId, apiKey } = useSettings.getState()
   const custom = useProviders.getState().providers.find((provider) => provider.id === providerId)
   if (custom && custom.baseUrl.trim()) {
-    return { apiKey: custom.apiKey, baseUrl: custom.baseUrl.trim() }
+    return { apiKey: custom.apiKey, baseUrl: custom.baseUrl.trim(), protocol: custom.protocol }
   }
-  return { apiKey: apiKey ?? '' }
+  return { apiKey: apiKey ?? '', protocol: 'anthropic' }
 }
 /** 服务端判定 file_id 失效后，重新补传并重发的最多次数（不含首次请求） */
 const FILE_RETRY_LIMIT = 2
@@ -869,6 +873,17 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   // 服务端判定 file_id 失效时会清掉会话里的 serverId，先用最新消息替换请求快照，
   // 否则快照里仍是旧 id，补传会直接复用它。
   request = refreshRequest(sessionId, request)
+  // OpenAI 兼容端点没有 Files API：附件不上传，请求里也不会带文件块
+  if (resolveRequestTarget().protocol === 'openai') {
+    const session = getSession(sessionId)
+    const resolve = <T extends Message>(message: T): T =>
+      (session?.messages.find((item) => item.id === message.id) as T | undefined) ?? message
+    return {
+      history: request.history.map(resolve),
+      question: resolve(request.question),
+      prefix: request.prefix,
+    }
+  }
   const apiKey = useSettings.getState().apiKey ?? ''
   const serverIds = new Map<string, string>()
   // 停止生成立即生效；上传本身不取消（输入框与其他消息可能共用同一任务），完成后照常写回 serverId
@@ -1048,24 +1063,24 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           latestReminder
         )
         const target = resolveRequestTarget()
-        const events = streamMessage(
-          target.apiKey,
-          {
-            model: initial.model ?? MODEL,
-            system: SYSTEM_PROMPT,
-            messages,
-            thinking: {
-              type: initial.thinking ? 'enabled' : 'disabled',
-              ...(initial.thinking ? thinkingBudget() : {}),
-            },
-            // 设置里关掉内容安全校验时不传该参数
-            ...(useSettings.getState().safetyCheck ? { safety_check: SAFETY_CHECK } : {}),
-            tools: serverTools(initial.search ?? false),
-            ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+        const payload: CreateMessageRequest = {
+          model: initial.model ?? MODEL,
+          system: SYSTEM_PROMPT,
+          messages,
+          thinking: {
+            type: initial.thinking ? 'enabled' : 'disabled',
+            ...(initial.thinking ? thinkingBudget() : {}),
           },
-          controller.signal,
-          target.baseUrl
-        )
+          // 设置里关掉内容安全校验时不传该参数
+          ...(useSettings.getState().safetyCheck ? { safety_check: SAFETY_CHECK } : {}),
+          tools: serverTools(initial.search ?? false),
+          ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+        }
+        // 自定义提供商可选 Anthropic /messages 或 OpenAI /chat/completions；内置 DeepSeek 始终走 Anthropic
+        const events =
+          target.protocol === 'openai'
+            ? streamChatCompletion(target.apiKey, payload, controller.signal, target.baseUrl ?? '')
+            : streamMessage(target.apiKey, payload, controller.signal, target.baseUrl)
         const blockIndexes = new Map<number, number>()
         for await (const event of events) {
           receivedContent ||= event.type === 'content_block_start'
