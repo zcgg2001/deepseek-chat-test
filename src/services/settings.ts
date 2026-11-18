@@ -151,7 +151,8 @@ export const useSettings = create<Settings>(() => ({
   thinking: read(KEYS.thinking) === 'true',
   search: initialSearch(),
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
-  model: read(KEYS.model) === 'deepseek-v4-pro' ? 'deepseek-v4-pro' : 'deepseek-flash',
+  // 保留上次选中的模型 id：自定义提供商的模型 id 也要能跨刷新存活，缺失时才回落默认
+  model: read(KEYS.model) || 'deepseek-flash',
   providerId: read(KEYS.providerId) || 'deepseek',
   thinkingEffort: (() => {
     const saved = read(KEYS.thinkingEffort)

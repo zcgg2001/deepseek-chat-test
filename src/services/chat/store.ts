@@ -35,6 +35,8 @@ import {
 
 /** 默认模型：deepseek-flash 同时支持深度思考与图片输入；可在输入框左侧切换 */
 const MODEL: ChatModel = 'deepseek-flash'
+/** 内置 DeepSeek 的模型 id；自定义提供商的模型不在其中 */
+const OFFICIAL_MODELS = new Set<ChatModel>(['deepseek-flash', 'deepseek-v4-pro'])
 /** 所有生成请求统一携带的助手身份说明 */
 const SYSTEM_PROMPT = '该助手为DeepSeek，由深度求索公司创造。'
 /** 保留最近打开的详情；当前会话、生成中及尚未成功保存的会话不淘汰。 */
@@ -66,6 +68,19 @@ const resolveRequestTarget = (): {
     return { apiKey: custom.apiKey, baseUrl: custom.baseUrl.trim(), protocol: custom.protocol }
   }
   return { apiKey: apiKey ?? '', protocol: 'anthropic' }
+}
+
+/**
+ * 选中的模型属于已被删除的自定义提供商时回落到内置默认模型，
+ * 避免把内置端点不认识的模型 id 发出去（内置 DeepSeek 只有自己的两个模型）。
+ */
+const resolveModel = (model: ChatModel | null | undefined): ChatModel => {
+  if (!model) {
+    return MODEL
+  }
+  const { providerId } = useSettings.getState()
+  const custom = useProviders.getState().providers.find((provider) => provider.id === providerId)
+  return custom || OFFICIAL_MODELS.has(model) ? model : MODEL
 }
 /** 服务端判定 file_id 失效后，重新补传并重发的最多次数（不含首次请求） */
 const FILE_RETRY_LIMIT = 2
@@ -768,7 +783,7 @@ export const continueReply = (sessionId: string, messageId: string) => {
   const reply: AssistantMessage = {
     ...previous,
     // 未记录请求配置的回复，续写时使用默认模型和当前开关。
-    model: previous.model ?? MODEL,
+    model: resolveModel(previous.model),
     thinking: previous.thinking ?? thinking,
     search: previous.search ?? search,
     status: 'pending',
@@ -1070,7 +1085,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           target.protocol === 'openai'
         )
         const payload: CreateMessageRequest = {
-          model: initial.model ?? MODEL,
+          model: resolveModel(initial.model),
           system: SYSTEM_PROMPT,
           messages,
           thinking: {
