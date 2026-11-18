@@ -6,15 +6,15 @@
 
 本仓库是 [deepseek-ai/chat-demo](https://github.com/deepseek-ai/chat-demo) 的非官方衍生版本，用于界面研究并做了扩展，与 DeepSeek 官方无关。用户界面参照 chat.deepseek.com 逐步重新实现。
 
-点击 [在线体验](https://deepseek.505zc.me/) 即可使用，也可以前往 [Releases](https://github.com/hmjz100/deepseek-chat-demo/releases) 下载压缩包，解压后双击 `index.html` 在本地使用，无需安装或构建。首次使用时，请在设置中填写 API Key。
+点击 [在线体验](https://deepseek.505zc.me/) 即可使用，也可以前往 [Releases](https://github.com/zcgg2001/deepseek-chat-test/releases) 下载压缩包，解压后双击 `index.html` 在本地使用，无需安装或构建。首次使用时，请在设置中填写 API Key。
 
 ## 运行
 
 准备 Node.js 22.12+ 和 pnpm：
 
 ```sh
-git clone https://github.com/hmjz100/deepseek-chat-demo.git
-cd deepseek-chat-demo
+git clone https://github.com/zcgg2001/deepseek-chat-test.git
+cd deepseek-chat-test
 pnpm install
 pnpm dev
 ```
